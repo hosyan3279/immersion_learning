@@ -1,22 +1,168 @@
 import React, { useState, useEffect, useRef } from 'react';
+import axios from 'axios';
+
+const MAX_TEXT_LENGTH = 128 * 1024; // 128 KiB in bytes
+
+const getDefinition = async (word) => {
+  try {
+    // まずFree Dictionary APIで定義を取得
+    const response = await axios.get(`https://api.dictionaryapi.dev/api/v2/entries/en/${word}`);
+    if (response.data && response.data.length > 0) {
+      const entry = response.data[0];
+      let definition = '';
+      
+      if (entry.meanings && entry.meanings.length > 0) {
+        const meaning = entry.meanings[0];
+        if (meaning.definitions && meaning.definitions.length > 0) {
+          definition = meaning.definitions[0].definition;
+        }
+      }
+      
+      if (definition) {
+        return definition;
+      }
+    }
+    
+    // 定義が見つからない場合、DeepLで単語を直接翻訳
+    console.log(`定義が見つからないため、"${word}"をDeepLで直接翻訳します。`);
+    const translatedWord = await translateToJapanese(word);
+    return `直接翻訳: ${translatedWord}`;
+
+  } catch (error) {
+    console.error("Definition fetch error:", error);
+    if (error.response && error.response.status === 404) {
+      // 404エラーの場合も、DeepLで単語を直接翻訳
+      console.log(`"${word}"が辞書にないため、DeepLで直接翻訳します。`);
+      try {
+        const translatedWord = await translateToJapanese(word);
+        return `直接翻訳: ${translatedWord}`;
+      } catch (deepLError) {
+        console.error("DeepL translation error:", deepLError);
+        return "定義の取得と翻訳に失敗しました。";
+      }
+    }
+    return "定義の取得中にエラーが発生しました。";
+  }
+};
+
+const translateToJapanese = async (text) => {
+  try {
+    // テキストが長すぎる場合は分割して送信
+    if (new Blob([text]).size > MAX_TEXT_LENGTH) {
+      const chunks = splitText(text);
+      const translatedChunks = await Promise.all(chunks.map(async (chunk) => {
+        const response = await axios.post('http://localhost:5000/api/translate', { text: chunk });
+        return response.data.translated_text;
+      }));
+      return translatedChunks.join(' ');
+    } else {
+      const response = await axios.post('http://localhost:5000/api/translate', { text });
+      return response.data.translated_text;
+    }
+  } catch (error) {
+    console.error("Translation error:", error);
+    if (error.response && error.response.data && error.response.data.error) {
+      return `翻訳エラー: ${error.response.data.error}`;
+    }
+    return "翻訳中にエラーが発生しました。";
+  }
+};
+
+// テキストを適切なサイズに分割する関数
+const splitText = (text) => {
+  const chunks = [];
+  let currentChunk = "";
+
+  text.split(".").forEach((sentence) => {
+    if (new Blob([currentChunk + sentence]).size > MAX_TEXT_LENGTH) {
+      chunks.push(currentChunk.trim());
+      currentChunk = "";
+    }
+    currentChunk += sentence + ".";
+  });
+
+  if (currentChunk) {
+    chunks.push(currentChunk.trim());
+  }
+
+  return chunks;
+};
+
+const splitDefinitions = (text) => {
+  return text.split(/[、。]/).filter(def => def.trim() !== '');
+};
 
 const Popup = ({ text, onClose, onWordSelect }) => {
   const [selectedWords, setSelectedWords] = useState([]);
+  const [definitions, setDefinitions] = useState({});
+  const [selectedDefinitions, setSelectedDefinitions] = useState({});
+  const [customDefinitions, setCustomDefinitions] = useState({});
+  const [translationInfo, setTranslationInfo] = useState("");
+  const [editingWord, setEditingWord] = useState(null);
 
   const handleWordClick = (word) => {
     if (selectedWords.includes(word)) {
       setSelectedWords(selectedWords.filter(w => w !== word));
+      setSelectedDefinitions(prev => {
+        const newDefs = {...prev};
+        delete newDefs[word];
+        return newDefs;
+      });
     } else {
       setSelectedWords([...selectedWords, word]);
     }
+  };
+
+  useEffect(() => {
+    const fetchDefinitions = async () => {
+      const newDefinitions = {};
+      for (const word of selectedWords) {
+        if (!definitions[word]) {
+          const definition = await getDefinition(word);
+          const translatedDefinition = await translateToJapanese(definition);
+          newDefinitions[word] = splitDefinitions(translatedDefinition);
+        }
+      }
+      setDefinitions(prev => ({...prev, ...newDefinitions}));
+    };
+
+    if (selectedWords.length > 0) {
+      fetchDefinitions();
+    }
+  }, [selectedWords]);
+
+  const handleDefinitionSelect = (word, definition) => {
+    setSelectedDefinitions(prev => ({...prev, [word]: definition}));
+  };
+
+  const handleCustomDefinitionChange = (word, value) => {
+    setCustomDefinitions(prev => ({...prev, [word]: value}));
+  };
+
+  const handleCustomDefinitionSave = (word) => {
+    const customDef = customDefinitions[word];
+    if (customDef && customDef.trim() !== '') {
+      setDefinitions(prev => ({
+        ...prev,
+        [word]: [...(prev[word] || []), customDef]
+      }));
+      setSelectedDefinitions(prev => ({...prev, [word]: customDef}));
+      setCustomDefinitions(prev => {
+        const newDefs = {...prev};
+        delete newDefs[word];
+        return newDefs;
+      });
+    }
+    setEditingWord(null);
   };
 
   const words = text.split(/\s+/);
 
   return (
     <div className="fixed inset-0 bg-black bg-opacity-50 flex items-center justify-center">
-      <div className="bg-white p-6 rounded-lg shadow-lg max-w-2xl w-full">
+      <div className="bg-white p-6 rounded-lg shadow-lg max-w-3xl w-full max-h-[80vh] overflow-y-auto">
         <h3 className="text-xl font-bold mb-4">センテンスと単語選択</h3>
+        <p className="mb-2 text-sm text-gray-600">{translationInfo}</p>
         <div className="mb-4">
           {words.map((word, index) => (
             <span
@@ -31,12 +177,79 @@ const Popup = ({ text, onClose, onWordSelect }) => {
           ))}
         </div>
         <div className="mb-4">
-          <h4 className="font-bold mb-2">選択された単語:</h4>
-          <p>{selectedWords.join(', ') || '未選択'}</p>
+          <h4 className="font-bold mb-2">選択された単語と定義:</h4>
+          {selectedWords.map(word => (
+            <div key={word} className="mb-4 p-2 border rounded">
+              <span className="font-semibold">{word}: </span>
+              {definitions[word] ? (
+                <div className="mt-2">
+                  {definitions[word].length <= 10 ? (
+                    <div className="flex flex-wrap mb-2">
+                      {definitions[word].map((def, index) => (
+                        <button
+                          key={index}
+                          onClick={() => handleDefinitionSelect(word, def)}
+                          className={`mr-2 mb-2 px-2 py-1 rounded text-sm ${
+                            selectedDefinitions[word] === def
+                              ? 'bg-blue-500 text-white'
+                              : 'bg-gray-200 text-gray-700'
+                          }`}
+                        >
+                          {def}
+                        </button>
+                      ))}
+                    </div>
+                  ) : null}
+                  <select
+                    value={selectedDefinitions[word] || ''}
+                    onChange={(e) => handleDefinitionSelect(word, e.target.value)}
+                    className="border p-1 mr-2 w-full mb-2"
+                  >
+                    <option value="">定義を選択 (または上のボタンから選択)</option>
+                    {definitions[word].map((def, index) => (
+                      <option key={index} value={def}>{def}</option>
+                    ))}
+                  </select>
+                  {editingWord === word ? (
+                    <div className="mt-2">
+                      <input
+                        type="text"
+                        value={customDefinitions[word] || ''}
+                        onChange={(e) => handleCustomDefinitionChange(word, e.target.value)}
+                        className="border p-1 mr-2 w-full mb-2"
+                        placeholder="カスタム定義を入力"
+                      />
+                      <button
+                        onClick={() => handleCustomDefinitionSave(word)}
+                        className="bg-green-500 text-white px-2 py-1 rounded text-sm mr-2"
+                      >
+                        保存
+                      </button>
+                      <button
+                        onClick={() => setEditingWord(null)}
+                        className="bg-gray-500 text-white px-2 py-1 rounded text-sm"
+                      >
+                        キャンセル
+                      </button>
+                    </div>
+                  ) : (
+                    <button
+                      onClick={() => setEditingWord(word)}
+                      className="bg-blue-500 text-white px-2 py-1 rounded text-sm"
+                    >
+                      カスタム定義を追加
+                    </button>
+                  )}
+                </div>
+              ) : (
+                "定義を読み込み中..."
+              )}
+            </div>
+          ))}
         </div>
         <div className="flex justify-end">
           <button 
-            onClick={() => onWordSelect(selectedWords)}
+            onClick={() => onWordSelect(selectedWords, selectedDefinitions)}
             className="bg-green-500 text-white px-4 py-2 rounded hover:bg-green-600 mr-2"
           >
             単語を確定
@@ -133,14 +346,13 @@ const YouTubeTranscription = () => {
     setSelectedWords([]);
   };
 
-  const handleWordSelect = (words) => {
+  const handleWordSelect = (words, definitions) => {
     setSelectedWords(words);
-    // ここで選択された単語を使って次のステップ（例：Ankiへの追加）を実行できます
-    console.log('選択された単語:', words);
+    // ここで選択された単語と定義を使って次のステップ（例：Ankiへの追加）を実行できます
+    console.log('選択された単語と定義:', words, definitions);
     // 今回はポップアップを閉じるだけにします
     handleClosePopup();
   };
-
   return (
     <div className="h-screen flex flex-col p-4">
       <div className="mb-4">
